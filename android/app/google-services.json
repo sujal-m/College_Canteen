@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "1074817937264",
+    "project_id": "spit-canteen",
+    "storage_bucket": "spit-canteen.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:1074817937264:android:b7a1892cf318eb4ca669b5",
+        "android_client_info": {
+          "package_name": "com.example.canteen"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBChGSfb80yhDmOrKYBSn2Ld17HQ7TqZv4"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
