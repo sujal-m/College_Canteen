@@ -637,7 +637,7 @@ class AuthProvider extends ChangeNotifier {
     }
   }
 
-  Future<void> setLocalPhotoPath(String uid, String path) async {
+  Future<void> setLocalPhotoPath(String uid, String? path) async {
     _localPhotoPath = path;
     notifyListeners();
   }
@@ -691,8 +691,13 @@ class FirebaseService {
         'emailLower': user.email.toLowerCase(),
       });
 
-  static Future<void> updateUserDoc(String uid, Map<String, dynamic> data) =>
-      _db.collection('users').doc(uid).update(data);
+  static Future<void> updateUserDoc(String uid, Map<String, dynamic> data) {
+    // Replace null values with FieldValue.delete() so Firestore fields are
+    // actually removed rather than left with a null/error value.
+    final cleaned = data.map((k, v) =>
+        MapEntry(k, v == null ? FieldValue.delete() : v));
+    return _db.collection('users').doc(uid).update(cleaned);
+  }
 
   static Future<bool> emailExists(String email) async {
     final snap = await _db
@@ -1523,75 +1528,95 @@ class _RegisterScreenState extends State<RegisterScreen> {
   Future<void> _register() async {
     if (_loading) return;
     if (!_formKey.currentState!.validate()) return;
-    setState(() {
-      _loading = true;
-      _error = null;
-    });
+
+    // Extra guard: confirm password match (belt-and-suspenders)
+    if (_password.text != _confirmPassword.text) {
+      setState(() => _error = 'Passwords do not match.');
+      return;
+    }
+
+    setState(() { _loading = true; _error = null; });
+
+    UserCredential? cred;
     try {
-      final email = _email.text.trim();
-      final ucid = _ucid.text.trim();
-      if (await FirebaseService.emailExists(email)) {
-        setState(() {
-          _error = 'This email is already registered.';
-          _loading = false;
-        });
-        return;
-      }
-      if (_userType == 'student' && await FirebaseService.ucidExists(ucid)) {
-        setState(() {
-          _error = 'This UCID is already registered.';
-          _loading = false;
-        });
-        return;
+      // Step 1: Create Firebase Auth account
+      cred = await FirebaseService.registerWithEmail(
+        _email.text.trim(), _password.text);
+
+      // Step 2: Send verification email (non-fatal if it fails)
+      try {
+        await FirebaseService.sendVerificationEmail();
+      } catch (e) {
+        debugPrint('Verification email failed (non-fatal): $e');
       }
 
-      final cred = 
-        await FirebaseService
-    .registerWithEmail(email, _password.text)
-    .timeout(const Duration(seconds: 10));
-      await FirebaseService.sendVerificationEmail();
+      // Step 3: Get FCM token (non-fatal if it fails)
       String? token;
       try {
-        token =
-            await FirebaseService.getFcmToken().timeout(const Duration(seconds: 5));
+        token = await FirebaseService.getFcmToken()
+            .timeout(const Duration(seconds: 5));
       } catch (_) {
         token = null;
       }
-      final user = UserModel(
+
+      // Step 4: Save user document to Firestore
+      final userModel = UserModel(
         uid: cred.user!.uid,
         fullName: _name.text.trim(),
-        email: email,
+        email: _email.text.trim(),
         gender: _gender!,
         branch: _branch!,
         role: _userType,
-        ucid: _userType == 'student' ? ucid : null,
+        ucid: _userType == 'student' ? _ucid.text.trim() : null,
         division: _userType == 'student' ? _division : null,
         classYear: _userType == 'student' ? _classYear : null,
         designation: _userType == 'faculty' ? _designation.text.trim() : null,
         fcmToken: token,
       );
-      await FirebaseService.createUserDoc(user);
+      await FirebaseService.createUserDoc(userModel);
+
       if (!mounted) return;
       Navigator.pushReplacement(context,
           MaterialPageRoute(builder: (_) => const VerifyEmailScreen()));
+
     } on FirebaseAuthException catch (e) {
+      // If Firestore doc creation failed after auth, delete the orphan account
+      if (cred != null) {
+        try { await cred.user?.delete(); } catch (_) {}
+      }
       if (!mounted) return;
-      setState(() {
-        _error = e.code == 'email-already-in-use'
-            ? 'This email is already registered.'
-            : 'Registration failed. Try again.';
-      });
+      String msg;
+      switch (e.code) {
+        case 'email-already-in-use':
+          msg = 'This email is already registered.';
+          break;
+        case 'invalid-email':
+          msg = 'The email address is invalid.';
+          break;
+        case 'weak-password':
+          msg = 'Password is too weak. Use at least 8 characters.';
+          break;
+        case 'network-request-failed':
+          msg = 'No internet connection. Please try again.';
+          break;
+        default:
+          msg = 'Registration failed (${e.code}). Please try again.';
+      }
+      setState(() => _error = msg);
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text(msg), backgroundColor: AppColors.error));
 
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(_error!)),
-      );
-    } catch (_) {
+    } catch (e) {
+      // Firestore write or other error after auth account was created
+      if (cred != null) {
+        try { await cred.user?.delete(); } catch (_) {}
+      }
       if (!mounted) return;
-      setState(() => _error = 'Registration failed. Try again.');
+      final msg = 'Registration failed: ${e.toString().split(']').last.trim()}';
+      setState(() => _error = msg);
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text(msg), backgroundColor: AppColors.error));
 
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(_error!)),
-      );
     } finally {
       if (mounted) setState(() => _loading = false);
     }
@@ -3316,10 +3341,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
         await picker.pickImage(source: ImageSource.gallery, imageQuality: 75);
     if (xfile == null) return;
     final file = File(xfile.path);
-    setState(() {
-      _uploading = true;
-      _localPhotoFile = file;
-    });
+    setState(() { _uploading = true; _localPhotoFile = file; });
     try {
       final uid = context.read<AuthProvider>().user!.uid;
       final savedPath = await LocalProfilePhotoStore.savePhoto(uid, file);
@@ -3336,10 +3358,124 @@ class _ProfileScreenState extends State<ProfileScreen> {
         backgroundColor: AppColors.error,
       ));
     } finally {
-      if (mounted) {
-        setState(() => _uploading = false);
-      }
+      if (mounted) setState(() => _uploading = false);
     }
+  }
+
+  Future<void> _removePhoto() async {
+    final uid = context.read<AuthProvider>().user!.uid;
+    setState(() => _uploading = true);
+    try {
+      await LocalProfilePhotoStore.clear(uid);
+      // Also clear from Firestore if there was a remote URL stored
+      await FirebaseService.updateUserDoc(uid, {'photoUrl': null});
+      await context.read<AuthProvider>().setLocalPhotoPath(uid, null);
+      if (!mounted) return;
+      setState(() => _localPhotoFile = null);
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+        content: Text('Profile photo removed.'),
+        backgroundColor: AppColors.success,
+      ));
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text('Failed to remove photo: $e'),
+        backgroundColor: AppColors.error,
+      ));
+    } finally {
+      if (mounted) setState(() => _uploading = false);
+    }
+  }
+
+  void _showPhotoOptions() {
+    final localPhotoPath = context.read<AuthProvider>().localPhotoPath;
+    final hasPhoto = _localPhotoFile != null ||
+        localPhotoPath != null ||
+        context.read<AuthProvider>().user?.photoUrl != null;
+
+    showModalBottomSheet(
+      context: context,
+      shape: const RoundedRectangleBorder(
+          borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
+      builder: (_) => SafeArea(
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          Container(
+            width: 40, height: 4,
+            margin: const EdgeInsets.symmetric(vertical: 12),
+            decoration: BoxDecoration(
+                color: Colors.grey.shade300,
+                borderRadius: BorderRadius.circular(2)),
+          ),
+          const Text('Profile Photo',
+              style: TextStyle(fontFamily: 'Playfair Display',
+                  fontSize: 18, fontWeight: FontWeight.w600)),
+          const SizedBox(height: 8),
+          ListTile(
+            leading: Container(
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                  color: AppColors.primary.withOpacity(0.1),
+                  shape: BoxShape.circle),
+              child: const Icon(Icons.photo_library_outlined,
+                  color: AppColors.primary),
+            ),
+            title: Text(hasPhoto ? 'Change Photo' : 'Upload Photo',
+                style: const TextStyle(fontFamily: 'Lato', fontWeight: FontWeight.w600)),
+            subtitle: const Text('Choose from your gallery',
+                style: TextStyle(fontFamily: 'Lato')),
+            onTap: () {
+              Navigator.pop(context);
+              _pickAndUploadPhoto();
+            },
+          ),
+          if (hasPhoto)
+            ListTile(
+              leading: Container(
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(
+                    color: AppColors.error.withOpacity(0.1),
+                    shape: BoxShape.circle),
+                child: const Icon(Icons.delete_outline, color: AppColors.error),
+              ),
+              title: const Text('Remove Photo',
+                  style: TextStyle(fontFamily: 'Lato',
+                      fontWeight: FontWeight.w600, color: AppColors.error)),
+              subtitle: const Text('Revert to default avatar',
+                  style: TextStyle(fontFamily: 'Lato')),
+              onTap: () async {
+                Navigator.pop(context);
+                // Ask for confirmation before removing
+                final confirmed = await showDialog<bool>(
+                  context: context,
+                  builder: (_) => AlertDialog(
+                    title: const Text('Remove Photo'),
+                    content: const Text(
+                        'Are you sure you want to remove your profile photo?'),
+                    actions: [
+                      TextButton(
+                          onPressed: () => Navigator.pop(context, false),
+                          child: const Text('Cancel')),
+                      ElevatedButton(
+                          style: ElevatedButton.styleFrom(
+                              backgroundColor: AppColors.error),
+                          onPressed: () => Navigator.pop(context, true),
+                          child: const Text('Remove')),
+                    ],
+                  ),
+                );
+                if (confirmed == true) _removePhoto();
+              },
+            ),
+          const SizedBox(height: 8),
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Cancel',
+                style: TextStyle(color: AppColors.textMuted, fontFamily: 'Lato')),
+          ),
+          const SizedBox(height: 8),
+        ]),
+      ),
+    );
   }
 
   @override
@@ -3366,7 +3502,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
         padding: const EdgeInsets.all(24),
         child: Column(children: [
           GestureDetector(
-            onTap: _pickAndUploadPhoto,
+            onTap: _uploading ? null : _showPhotoOptions,
             child: Stack(children: [
               CircleAvatar(
                   radius: 56,
@@ -3389,17 +3525,25 @@ class _ProfileScreenState extends State<ProfileScreen> {
                   right: 0,
                   child: Container(
                       padding: const EdgeInsets.all(6),
-                      decoration: const BoxDecoration(
-                          color: AppColors.primary, shape: BoxShape.circle),
+                      decoration: BoxDecoration(
+                          color: _uploading
+                              ? Colors.grey
+                              : AppColors.primary,
+                          shape: BoxShape.circle),
                       child: _uploading
                           ? const SizedBox(
                               width: 16,
                               height: 16,
                               child: CircularProgressIndicator(
                                   color: Colors.white, strokeWidth: 2))
-                          : const Icon(Icons.camera_alt,
+                          : const Icon(Icons.edit,
                               size: 16, color: Colors.white))),
             ]),
+          ),
+          const SizedBox(height: 6),
+          Text(
+            'Tap to change or remove photo',
+            style: AppTextStyles.labelSmall.copyWith(color: AppColors.textMuted),
           ),
           const SizedBox(height: 24),
           _ProfileRow('Name', user?.fullName ?? '—'),
