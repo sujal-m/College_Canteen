@@ -506,6 +506,37 @@ class OrderModel {
       );
 }
 
+class UserNotification {
+  final String id;
+  final String orderId;
+  final String title;
+  final String message;
+  final String status;
+  final Timestamp? createdAt;
+  final bool read;
+
+  UserNotification({
+    required this.id,
+    required this.orderId,
+    required this.title,
+    required this.message,
+    required this.status,
+    required this.createdAt,
+    required this.read,
+  });
+
+  factory UserNotification.fromMap(Map<String, dynamic> map, String id) =>
+      UserNotification(
+        id: id,
+        orderId: map['orderId'] ?? '',
+        title: map['title'] ?? 'Notification',
+        message: map['message'] ?? '',
+        status: map['status'] ?? '',
+        createdAt: map['createdAt'] as Timestamp?,
+        read: map['read'] ?? false,
+      );
+}
+
 // ─────────────────────────────────────────────────────────
 //  PROVIDERS
 // ─────────────────────────────────────────────────────────
@@ -728,8 +759,65 @@ class FirebaseService {
       .orderBy('createdAt', descending: true)
       .snapshots();
 
-  static Future<void> updateOrderStatus(String id, String status) =>
-      _db.collection('orders').doc(id).update({'status': status});
+  static Stream<QuerySnapshot> userNotificationsStream(String uid) => _db
+      .collection('users')
+      .doc(uid)
+      .collection('notifications')
+      .orderBy('createdAt', descending: true)
+      .snapshots();
+
+  static Future<void> markNotificationRead(String uid, String notificationId) =>
+      _db
+          .collection('users')
+          .doc(uid)
+          .collection('notifications')
+          .doc(notificationId)
+          .update({'read': true});
+
+  static Future<void> markAllNotificationsRead(String uid) async {
+    final snap = await _db
+        .collection('users')
+        .doc(uid)
+        .collection('notifications')
+        .where('read', isEqualTo: false)
+        .get();
+    final batch = _db.batch();
+    for (final doc in snap.docs) {
+      batch.update(doc.reference, {'read': true});
+    }
+    await batch.commit();
+  }
+
+  static Future<void> updateOrderStatus(String id, String status) async {
+    final orderRef = _db.collection('orders').doc(id);
+    final orderSnap = await orderRef.get();
+    if (!orderSnap.exists) return;
+
+    final order = OrderModel.fromMap(orderSnap.data()!, orderSnap.id);
+    if (order.status == status) return;
+
+    await orderRef.update({'status': status});
+
+    final notificationRef = _db
+        .collection('users')
+        .doc(order.userId)
+        .collection('notifications')
+        .doc();
+
+    try {
+      await notificationRef.set({
+        'orderId': order.id,
+        'title': 'Order status updated',
+        'message':
+            'Your order #${order.id.substring(0, 8)} moved from ${order.status} to $status.',
+        'status': status,
+        'read': false,
+        'createdAt': FieldValue.serverTimestamp(),
+      });
+    } catch (e) {
+      debugPrint('Notification write failed for order status update: $e');
+    }
+  }
 
   // ── Storage: Images ───────────────────────────────────
   static Future<String> uploadImage(File file, String path) async {
@@ -742,34 +830,77 @@ class FirebaseService {
   static Future<String?> getFcmToken() => _messaging.getToken();
 }
 
+Future<void> downloadInvoicePdf(BuildContext context, OrderModel order) async {
+  try {
+    final pdfFile = await PdfService.generateInvoice(order);
+    await OpenFile.open(pdfFile.path);
+    if (!context.mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+      content: Text('Invoice PDF opened successfully.'),
+      backgroundColor: AppColors.success,
+    ));
+  } catch (e) {
+    if (!context.mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Text('Failed to generate invoice: $e'),
+      backgroundColor: AppColors.error,
+    ));
+  }
+}
+
 // ─────────────────────────────────────────────────────────
 //  PDF GENERATOR
 // ─────────────────────────────────────────────────────────
 class PdfService {
+  static pw.Font? _regularFont;
+  static pw.Font? _boldFont;
+
+  static Future<pw.Font> _loadRegularFont() async {
+    if (_regularFont != null) return _regularFont!;
+    final data = await rootBundle.load('assets/fonts/Lato-Regular.ttf');
+    _regularFont = pw.Font.ttf(data);
+    return _regularFont!;
+  }
+
+  static Future<pw.Font> _loadBoldFont() async {
+    if (_boldFont != null) return _boldFont!;
+    final data = await rootBundle.load('assets/fonts/Lato-Bold.ttf');
+    _boldFont = pw.Font.ttf(data);
+    return _boldFont!;
+  }
+
   static Future<File> generateInvoice(OrderModel order) async {
+    final regular = await _loadRegularFont();
+    final bold = await _loadBoldFont();
     final pdf = pw.Document();
+    const rupee = '\u20B9';
     pdf.addPage(
       pw.Page(
         pageFormat: PdfPageFormat.a4,
+        theme: pw.ThemeData.withFont(base: regular, bold: bold),
         build: (ctx) => pw.Column(
           crossAxisAlignment: pw.CrossAxisAlignment.start,
           children: [
             pw.Text('SPIT Campus Canteen',
-                style:
-                    pw.TextStyle(fontSize: 22, fontWeight: pw.FontWeight.bold)),
+                style: pw.TextStyle(
+                    fontSize: 22, fontWeight: pw.FontWeight.bold, font: bold)),
             pw.Text('SPIT Pvt. Ltd.', style: const pw.TextStyle(fontSize: 12)),
             pw.Divider(),
             pw.SizedBox(height: 8),
             pw.Text('Invoice / Order Receipt',
-                style:
-                    pw.TextStyle(fontSize: 16, fontWeight: pw.FontWeight.bold)),
+                style: pw.TextStyle(
+                    fontSize: 16, fontWeight: pw.FontWeight.bold, font: bold)),
             pw.SizedBox(height: 8),
             pw.Row(
                 mainAxisAlignment: pw.MainAxisAlignment.spaceBetween,
                 children: [
                   pw.Text('Order ID: ${order.id.substring(0, 8)}'),
                   pw.Text(
-                      'Date: ${DateFormat('dd MMM yyyy, hh:mm a').format(order.createdAt.toDate())}'),
+                      'Date: ${DateFormat('dd MMM yyyy, hh:mm a').format(
+                                order.createdAt != null
+                                    ? order.createdAt.toDate()
+                                    : DateTime.now(),
+                              )}'),
                 ]),
             pw.SizedBox(height: 8),
             pw.Text('Customer: ${order.userName}'),
@@ -777,21 +908,23 @@ class PdfService {
             if (order.ucid != null) pw.Text('UCID: ${order.ucid}'),
             pw.SizedBox(height: 12),
             pw.Divider(),
-            pw.Table.fromTextArray(
+            pw.TableHelper.fromTextArray(
               headers: ['Item', 'Qty', 'Price', 'Subtotal'],
-              data: order.items
-                  .map((i) => [
-                        i['name'],
-                        i['quantity'].toString(),
-                        '₹${i['price'].toStringAsFixed(2)}',
-                        '₹${(i['price'] * i['quantity']).toStringAsFixed(2)}',
-                      ])
-                  .toList(),
+              data: order.items.map((i) => [
+                    i['name'],
+                    i['quantity'].toString(),
+                    NumberFormat.currency(locale: 'en_IN', symbol: '₹')
+                        .format((i['price'] as num).toDouble()),
+                    NumberFormat.currency(locale: 'en_IN', symbol: '₹')
+                        .format((i['price'] as num).toDouble() *
+                            (i['quantity'] as num)),
+                  ]).toList(),
             ),
             pw.Divider(),
             pw.Align(
               alignment: pw.Alignment.centerRight,
-              child: pw.Text('Total: ₹${order.total.toStringAsFixed(2)}',
+              child: pw.Text(
+  'Total: ${NumberFormat.currency(locale: 'en_IN', symbol: '₹').format(order.total)}',
                   style: pw.TextStyle(
                       fontSize: 16, fontWeight: pw.FontWeight.bold)),
             ),
@@ -800,18 +933,24 @@ class PdfService {
                 style: const pw.TextStyle(fontSize: 12)),
             pw.SizedBox(height: 20),
             pw.Center(
-                child: pw.Text('Thank you for your order! 🙏',
+                child: pw.Text('Thank you for your order!',
                     style: const pw.TextStyle(fontSize: 12))),
             pw.Center(
-                child: pw.Text('— SPIT Pvt. Ltd. —',
+                child: pw.Text('SPIT Pvt. Ltd.',
                     style: const pw.TextStyle(fontSize: 11))),
           ],
         ),
       ),
     );
 
-    final dir = await getTemporaryDirectory();
-    final file = File('${dir.path}/invoice_${order.id.substring(0, 8)}.pdf');
+    final dir = await getApplicationDocumentsDirectory();
+    final invoiceDir = Directory('${dir.path}/invoices');
+    if (!await invoiceDir.exists()) {
+      await invoiceDir.create(recursive: true);
+    }
+    final file = File(
+      '${invoiceDir.path}/invoice_${order.id.substring(0, 8)}.pdf',
+    );
     await file.writeAsBytes(await pdf.save());
     return file;
   }
@@ -1102,6 +1241,12 @@ class LoginScreen extends StatefulWidget {
 }
 
 class _LoginScreenState extends State<LoginScreen> {
+  @override
+  void dispose() {
+    _emailCtrl.dispose();
+    _passwordCtrl.dispose();
+    super.dispose();
+  }
   final _formKey = GlobalKey<FormState>();
   final _emailCtrl = TextEditingController();
   final _passwordCtrl = TextEditingController();
@@ -1148,10 +1293,14 @@ class _LoginScreenState extends State<LoginScreen> {
             (_) => false);
       }
     } on FirebaseAuthException catch (e) {
+
       setState(() {
         _error = _authError(e.code);
         _loading = false;
       });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(_error!)),
+      );
     }
   }
 
@@ -1344,15 +1493,35 @@ class _RegisterScreenState extends State<RegisterScreen> {
   final _email = TextEditingController();
   final _ucid = TextEditingController();
   final _password = TextEditingController();
+  final _confirmPassword = TextEditingController();
   final _designation = TextEditingController();
-  bool _showPass = false, _loading = false;
+  bool _showPass = false, _showConfirmPass = false, _loading = false;
   String? _error;
 
   List<String> get _classOptions => classOptionsForBranch(_branch);
 
   PasswordStrength get _strength => Validators.passwordStrength(_password.text);
+  PasswordStrength get _confirmStrength =>
+      Validators.passwordStrength(_confirmPassword.text);
+
+  void _resetFormForUserType(String userType) {
+    _formKey.currentState?.reset();
+    _userType = userType;
+    _gender = null;
+    _branch = null;
+    _classYear = null;
+    _division = null;
+    _error = null;
+    _name.clear();
+    _email.clear();
+    _ucid.clear();
+    _password.clear();
+    _confirmPassword.clear();
+    _designation.clear();
+  }
 
   Future<void> _register() async {
+    if (_loading) return;
     if (!_formKey.currentState!.validate()) return;
     setState(() {
       _loading = true;
@@ -1376,10 +1545,18 @@ class _RegisterScreenState extends State<RegisterScreen> {
         return;
       }
 
-      final cred =
-          await FirebaseService.registerWithEmail(email, _password.text);
+      final cred = 
+        await FirebaseService
+    .registerWithEmail(email, _password.text)
+    .timeout(const Duration(seconds: 10));
       await FirebaseService.sendVerificationEmail();
-      final token = await FirebaseService.getFcmToken();
+      String? token;
+      try {
+        token =
+            await FirebaseService.getFcmToken().timeout(const Duration(seconds: 5));
+      } catch (_) {
+        token = null;
+      }
       final user = UserModel(
         uid: cred.user!.uid,
         fullName: _name.text.trim(),
@@ -1394,16 +1571,41 @@ class _RegisterScreenState extends State<RegisterScreen> {
         fcmToken: token,
       );
       await FirebaseService.createUserDoc(user);
+      if (!mounted) return;
       Navigator.pushReplacement(context,
           MaterialPageRoute(builder: (_) => const VerifyEmailScreen()));
     } on FirebaseAuthException catch (e) {
+      if (!mounted) return;
       setState(() {
         _error = e.code == 'email-already-in-use'
             ? 'This email is already registered.'
             : 'Registration failed. Try again.';
-        _loading = false;
       });
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(_error!)),
+      );
+    } catch (_) {
+      if (!mounted) return;
+      setState(() => _error = 'Registration failed. Try again.');
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(_error!)),
+      );
+    } finally {
+      if (mounted) setState(() => _loading = false);
     }
+  }
+
+  @override
+  void dispose() {
+    _name.dispose();
+    _email.dispose();
+    _ucid.dispose();
+    _password.dispose();
+    _confirmPassword.dispose();
+    _designation.dispose();
+    super.dispose();
   }
 
   @override
@@ -1427,8 +1629,8 @@ class _RegisterScreenState extends State<RegisterScreen> {
                             .map((t) => Expanded(
                                   child: GestureDetector(
                                     onTap: () => setState(() {
-                                      _userType = t;
-                                      _classYear = null;
+                                      if (_userType == t) return;
+                                      _resetFormForUserType(t);
                                     }),
                                     child: Container(
                                       padding: const EdgeInsets.symmetric(
@@ -1581,6 +1783,35 @@ class _RegisterScreenState extends State<RegisterScreen> {
                   const SizedBox(height: 8),
                   _PasswordStrengthBar(
                       strength: _strength, password: _password.text),
+                  const SizedBox(height: 14),
+
+                  TextFormField(
+                      controller: _confirmPassword,
+                      obscureText: !_showConfirmPass,
+                      onChanged: (_) => setState(() {}),
+                      decoration: InputDecoration(
+                          labelText: 'Confirm Password',
+                          prefixIcon: const Icon(Icons.lock_outline),
+                          suffixIcon: IconButton(
+                              icon: Icon(_showConfirmPass
+                                  ? Icons.visibility_off
+                                  : Icons.visibility),
+                              onPressed: () => setState(() =>
+                                  _showConfirmPass = !_showConfirmPass))),
+                      validator: (v) {
+                        if (v == null || v.isEmpty)
+                          return 'Confirm password is required';
+                        if (v.length < 8) return 'Minimum 8 characters';
+                        if (Validators.passwordStrength(v) ==
+                            PasswordStrength.weak)
+                          return 'Password is too weak';
+                        if (v != _password.text) return 'Passwords do not match';
+                        return null;
+                      }),
+                  const SizedBox(height: 8),
+                  _PasswordStrengthBar(
+                      strength: _confirmStrength,
+                      password: _confirmPassword.text),
                   const SizedBox(height: 24),
 
                   _loading
@@ -1687,8 +1918,45 @@ class UserShellScreen extends StatefulWidget {
 
 class _UserShellScreenState extends State<UserShellScreen> {
   int _tab = 0;
+  StreamSubscription<QuerySnapshot>? _orderStatusSubscription;
+  final Set<String> _knownNotificationIds = {};
+  bool _notificationFeedPrimed = false;
 
   static const _titles = ['SPIT Canteen', 'Menu', 'Cart'];
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final userId = context.read<AuthProvider>().user?.uid;
+    if (userId == null || _orderStatusSubscription != null) return;
+    _orderStatusSubscription =
+        FirebaseService.userNotificationsStream(userId).listen((snapshot) {
+      for (final doc in snapshot.docs) {
+        final notification = UserNotification.fromMap(
+          doc.data() as Map<String, dynamic>,
+          doc.id,
+        );
+        if (_notificationFeedPrimed &&
+            !_knownNotificationIds.contains(notification.id) &&
+            mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text(notification.message),
+              backgroundColor: AppColors.primary,
+            ),
+          );
+        }
+        _knownNotificationIds.add(notification.id);
+      }
+      _notificationFeedPrimed = true;
+    });
+  }
+
+  @override
+  void dispose() {
+    _orderStatusSubscription?.cancel();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -1700,6 +1968,10 @@ class _UserShellScreenState extends State<UserShellScreen> {
       drawer: _AppDrawer(user: user),
       appBar: AppBar(
         title: Text(_titles[_tab]),
+        actions: [
+          if (user != null)
+            _NotificationBell(userId: user.uid),
+        ],
         leading: Builder(
           builder: (ctx) => Padding(
             padding: const EdgeInsets.all(8),
@@ -1825,6 +2097,19 @@ class _AppDrawer extends StatelessWidget {
                     context,
                     MaterialPageRoute(
                         builder: (_) => const OrderHistoryScreen()));
+              }),
+          ListTile(
+              leading: const Icon(Icons.notifications_none,
+                  color: AppColors.primary),
+              title: const Text('Notifications'),
+              onTap: () {
+                final userId = user?.uid;
+                Navigator.pop(context);
+                if (userId == null) return;
+                Navigator.push(
+                    context,
+                    MaterialPageRoute(
+                        builder: (_) => NotificationScreen(userId: userId)));
               }),
           const Spacer(),
           const Divider(),
@@ -2503,7 +2788,7 @@ class _AnimatedSpecialsCarouselState extends State<_AnimatedSpecialsCarousel> {
   @override
   Widget build(BuildContext context) {
     return SizedBox(
-      height: 240,
+      height: 280,
       child: PageView.builder(
         controller: _controller,
         itemCount: widget.items.length,
@@ -2810,6 +3095,140 @@ class OrderHistoryScreen extends StatelessWidget {
   }
 }
 
+class _NotificationBell extends StatelessWidget {
+  final String userId;
+  const _NotificationBell({required this.userId});
+
+  @override
+  Widget build(BuildContext context) {
+    return StreamBuilder<QuerySnapshot>(
+      stream: FirebaseService.userNotificationsStream(userId),
+      builder: (context, snapshot) {
+        final docs = snapshot.data?.docs ?? [];
+        final unread = docs.where((doc) {
+          final data = doc.data() as Map<String, dynamic>;
+          return data['read'] != true;
+        }).length;
+        return IconButton(
+          onPressed: () {
+            Navigator.push(
+              context,
+              MaterialPageRoute(
+                builder: (_) => NotificationScreen(userId: userId),
+              ),
+            );
+          },
+          icon: Badge(
+            isLabelVisible: unread > 0,
+            label: Text('$unread'),
+            child: const Icon(Icons.notifications_none),
+          ),
+        );
+      },
+    );
+  }
+}
+
+class NotificationScreen extends StatelessWidget {
+  final String userId;
+  const NotificationScreen({super.key, required this.userId});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Notifications'),
+        actions: [
+          TextButton(
+            onPressed: () => FirebaseService.markAllNotificationsRead(userId),
+            child: const Text(
+              'Mark all read',
+              style: TextStyle(color: Colors.white),
+            ),
+          ),
+        ],
+      ),
+      body: StreamBuilder<QuerySnapshot>(
+        stream: FirebaseService.userNotificationsStream(userId),
+        builder: (context, snapshot) {
+          if (!snapshot.hasData) {
+            return const Center(
+              child: CircularProgressIndicator(color: AppColors.primary),
+            );
+          }
+          if (snapshot.data!.docs.isEmpty) {
+            return const Center(
+              child: Text(
+                'No notifications yet',
+                style: AppTextStyles.bodyMedium,
+              ),
+            );
+          }
+
+          final notifications = snapshot.data!.docs
+              .map((doc) => UserNotification.fromMap(
+                    doc.data() as Map<String, dynamic>,
+                    doc.id,
+                  ))
+              .toList();
+
+          return ListView.separated(
+            padding: const EdgeInsets.all(16),
+            itemCount: notifications.length,
+            separatorBuilder: (_, __) => const SizedBox(height: 12),
+            itemBuilder: (context, index) {
+              final notification = notifications[index];
+              final createdAt = notification.createdAt?.toDate();
+              return Card(
+                color:
+                    notification.read ? Colors.white : AppColors.bg,
+                child: ListTile(
+                  contentPadding: const EdgeInsets.all(16),
+                  leading: CircleAvatar(
+                    backgroundColor: AppColors.primary.withOpacity(0.12),
+                    child: const Icon(
+                      Icons.notifications_active_outlined,
+                      color: AppColors.primary,
+                    ),
+                  ),
+                  title: Text(
+                    notification.title,
+                    style: const TextStyle(
+                      fontWeight: FontWeight.w700,
+                      fontFamily: 'Lato',
+                    ),
+                  ),
+                  subtitle: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const SizedBox(height: 6),
+                      Text(notification.message, style: AppTextStyles.bodyMedium),
+                      const SizedBox(height: 8),
+                      Text(
+                        createdAt == null
+                            ? 'Just now'
+                            : DateFormat('dd MMM yyyy, hh:mm a')
+                                .format(createdAt),
+                        style: AppTextStyles.labelSmall,
+                      ),
+                    ],
+                  ),
+                  trailing: notification.read
+                      ? null
+                      : const Icon(Icons.fiber_manual_record,
+                          size: 12, color: AppColors.primary),
+                  onTap: () =>
+                      FirebaseService.markNotificationRead(userId, notification.id),
+                ),
+              );
+            },
+          );
+        },
+      ),
+    );
+  }
+}
+
 class _OrderCard extends StatelessWidget {
   final OrderModel order;
   const _OrderCard({required this.order});
@@ -2864,6 +3283,15 @@ class _OrderCard extends StatelessWidget {
                       .format(order.createdAt.toDate()),
                   style: AppTextStyles.labelSmall),
             ]),
+            const SizedBox(height: 10),
+            Align(
+              alignment: Alignment.centerRight,
+              child: OutlinedButton.icon(
+                onPressed: () => downloadInvoicePdf(context, order),
+                icon: const Icon(Icons.download_outlined),
+                label: const Text('Download Invoice'),
+              ),
+            ),
           ]),
         ),
       );
@@ -3310,12 +3738,31 @@ class _OrdersList extends StatelessWidget {
                                   style: ElevatedButton.styleFrom(
                                       padding: const EdgeInsets.symmetric(
                                           horizontal: 16, vertical: 8)),
-                                  onPressed: () =>
-                                      FirebaseService.updateOrderStatus(
-                                          order.id, next),
+                                  onPressed: () async {
+                                    try {
+                                      await FirebaseService.updateOrderStatus(
+                                          order.id, next);
+                                    } catch (_) {
+                                      if (!context.mounted) return;
+                                      ScaffoldMessenger.of(context)
+                                          .showSnackBar(const SnackBar(
+                                        content: Text(
+                                            'Failed to update order status. Please try again.'),
+                                      ));
+                                    }
+                                  },
                                   child: Text('Mark $next',
                                       style: const TextStyle(fontSize: 12))),
                           ]),
+                      const SizedBox(height: 10),
+                      Align(
+                        alignment: Alignment.centerRight,
+                        child: OutlinedButton.icon(
+                          onPressed: () => downloadInvoicePdf(context, order),
+                          icon: const Icon(Icons.download_outlined),
+                          label: const Text('Download Invoice'),
+                        ),
+                      ),
                     ]),
               ),
             );
